@@ -5,6 +5,8 @@ const { Pool } = require('pg');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -55,8 +57,8 @@ app.get('/admin/products', async (req, res) => {
     }
   });
 
-// GET /api/products
-app.get('/api/products', async (req, res) => {
+// GET /api/products (protected)
+app.get('/api/products', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT id, name, price, image, available FROM products');
     res.json(result.rows);
@@ -136,6 +138,91 @@ app.put('/admin/products/:id', async (req, res) => {
   }
 });
 
+// --- Admin Authentication ---
+const adminSecret = process.env.ADMIN_JWT_SECRET || 'adminsecret';
+
+// Admin login endpoint
+app.post('/api/admin/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  try {
+    const result = await pool.query('SELECT * FROM admins WHERE email = $1', [email]);
+    if (result.rows.length === 0) return res.status(400).json({ error: 'Invalid credentials' });
+    const admin = result.rows[0];
+    const match = await bcrypt.compare(password, admin.password);
+    if (!match) return res.status(400).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ id: admin.id, email: admin.email, username: admin.username }, adminSecret, { expiresIn: '1d' });
+    res.json({ token, admin: { id: admin.id, email: admin.email, username: admin.username } });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Add new admin (admin only)
+app.post('/api/admin/add', adminAuthenticateToken, async (req, res) => {
+  const { username, email, password, name, phone_number } = req.body;
+  if (!username || !email || !password) return res.status(400).json({ error: 'Username, email, and password required' });
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      'INSERT INTO admins (username, email, password, name, phone_number) VALUES ($1, $2, $3, $4, $5) RETURNING id, username, email, name, phone_number',
+      [username, email, hash, name || null, phone_number || null]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ error: 'Email or username already exists' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update admin profile (admin only)
+app.put('/api/admin/profile', adminAuthenticateToken, async (req, res) => {
+  const { username, name, email, phone_number } = req.body;
+  const adminId = req.admin.id;
+  if (!username || !email) return res.status(400).json({ error: 'Username and email required' });
+  try {
+    const result = await pool.query(
+      'UPDATE admins SET username = $1, name = $2, email = $3, phone_number = $4 WHERE id = $5 RETURNING id, username, name, email, phone_number',
+      [username, name || null, email, phone_number || null, adminId]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ error: 'Email or username already exists' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Middleware to authenticate admin JWT and check email in admins table
+async function adminAuthenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.sendStatus(401);
+  try {
+    const decoded = jwt.verify(token, adminSecret);
+    // Check if email exists in admins table
+    const result = await pool.query('SELECT * FROM admins WHERE email = $1', [decoded.email]);
+    if (result.rows.length === 0) return res.sendStatus(403);
+    req.admin = decoded;
+    next();
+  } catch (err) {
+    return res.sendStatus(403);
+  }
+}
+
+// --- Protect all /admin/* routes ---
+app.use('/admin', adminAuthenticateToken);
+
+// Delete product (admin only) - must be after adminAuthenticateToken middleware
+app.delete('/admin/products/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await pool.query('DELETE FROM products WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /admin/orders/today
 app.get('/admin/orders/today', async (req, res) => {
   try {
@@ -170,6 +257,79 @@ app.get('/admin/orders/summary', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Register endpoint (updated for full user info)
+app.post('/api/register', async (req, res) => {
+  const { name, email, password, phone_number, location, home_address, role } = req.body;
+  if (!name || !email || !password) return res.status(400).json({ error: 'Name, email, and password required' });
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      'INSERT INTO users (name, email, password, phone_number, location, home_address, role) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, name, email, phone_number, location, home_address, role',
+      [name, email, hash, phone_number || null, location || null, home_address || null, role || 'user']
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ error: 'Email already exists' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Unified login for both admin and user
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  try {
+    // 1. Check admins table first
+    let result = await pool.query('SELECT * FROM admins WHERE email = $1', [email]);
+    if (result.rows.length > 0) {
+      const admin = result.rows[0];
+      const match = await bcrypt.compare(password, admin.password);
+      if (!match) return res.status(400).json({ error: 'Invalid credentials' });
+      const token = jwt.sign({ id: admin.id, email: admin.email, username: admin.username, type: 'admin' }, process.env.ADMIN_JWT_SECRET || 'adminsecret', { expiresIn: '1d' });
+      return res.json({ token, userType: 'admin', admin: { id: admin.id, email: admin.email, username: admin.username } });
+    }
+    // 2. If not admin, check users table
+    result = await pool.query('SELECT id, name, email, password, phone_number, location, home_address, role FROM users WHERE email = $1', [email]);
+    if (result.rows.length === 0) return res.status(400).json({ error: 'Invalid credentials' });
+    const user = result.rows[0];
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) return res.status(400).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, type: 'user' }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
+    // Exclude password from user object
+    const { password: _, ...userInfo } = user;
+    res.json({ token, userType: 'user', user: userInfo });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Auth middleware
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) {
+    console.log('No token provided');
+    return res.sendStatus(401);
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET || 'secret', (err, user) => {
+    if (!err) {
+      req.user = user;
+      console.log('User token valid:', user);
+      return next();
+    }
+    jwt.verify(token, process.env.ADMIN_JWT_SECRET || 'adminsecret', (err2, admin) => {
+      if (!err2) {
+        req.user = admin;
+        console.log('Admin token valid:', admin);
+        return next();
+      }
+      console.log('Invalid token');
+      return res.sendStatus(403);
+    });
+  });
+}
 
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
