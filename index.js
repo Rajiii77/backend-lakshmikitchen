@@ -11,14 +11,41 @@ const nodemailer = require('nodemailer');
 const Razorpay = require('razorpay');
 const otpStore = {};
 
-// Initialize Razorpay
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_your_key_id',
-  key_secret: process.env.RAZORPAY_KEY_SECRET || 'your_key_secret'
-});
+
+require('dotenv').config();
+
 
 const app = express();
-const port = 5000;
+const port = process.env.PORT || 5000;
+
+// Example DB connection (PostgreSQL)
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+module.exports = pool;
+// Example route
+app.get('/', (req, res) => {
+  res.send('Server running with Neon DB!');
+});
+
+// Start server
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
+
+
+app.get('/test-db', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW()');
+    res.send(`Database connected! Server time: ${result.rows[0].now}`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Database connection failed!');
+  }
+});
+
 
 app.use(cors());
 // Remove body-parser and use express.json() and express.urlencoded()
@@ -26,10 +53,8 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/lakshmi_kitchen',
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-});
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`API on ${PORT}`));
 
 // Test database connection
 pool.on('connect', () => {
