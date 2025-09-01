@@ -46,6 +46,9 @@ app.get('/test-db', async (req, res) => {
   }
 });
 
+app.get("/healthz", (req, res) => {
+  res.status(200).send("OK");
+});
 
 app.use(cors());
 // Remove body-parser and use express.json() and express.urlencoded()
